@@ -1,16 +1,19 @@
 import cv2
 import numpy as np
 import torch
+from io import BytesIO
+from PIL import Image as PILImage
 import streamlit as st
 import tempfile
 import os
 from PIL import Image
-from io import BytesIO
+from io import BytesIO as _BytesIO
 import albumentations as A
 import zipfile
 import re
 import pandas as pd
 from urllib.parse import quote
+from PIL import Image as PILImage
 
 # ——— Константы ———
 CLASS_LIST = ["фон", "мох", "почва"]
@@ -98,15 +101,22 @@ def load_uploaded_images(label_text):
 def render_mask_overlay(mask: np.ndarray, base_img: np.ndarray, visibility: dict):
     color_scheme = {
         "фон": np.array([0, 0, 0]),
-        "мох": np.array([42, 125, 209]),
-        "почва": np.array([170, 240, 209]),
+        "мох": np.array([42, 125, 209]),      
+        "почва": np.array([210, 180, 140]),   
     }
-    painted = base_img.copy()
+
+    overlay = base_img.copy()
+    transparent = np.zeros_like(base_img)
+
     for idx, label in enumerate(CLASS_LIST):
-        if not visibility.get(label, False):
-            continue
-        painted[mask == idx] = color_scheme[label]
-    return painted
+        if visibility.get(label, False):
+            if label == "фон":
+                overlay[mask == idx] = color_scheme[label]  # фон — полностью
+            else:
+                transparent[mask == idx] = color_scheme[label]  # полупрозрачные
+
+    blended = cv2.addWeighted(overlay, 1, transparent, 0.7, 0)
+    return blended
 
 # ——— Интерфейс Streamlit ———
 def main_app():
@@ -143,13 +153,13 @@ def main_app():
     st.markdown("### 📊 Сводная таблица покрытия мхом по образцам")
     st.dataframe(df)
 
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="Анализ мха")
 
     st.sidebar.download_button(
         label="📥 Скачать таблицу (.xlsx)",
-        data=buffer.getvalue(),
+        data=buf.getvalue(),
         file_name="сводная_таблица_мха.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
@@ -200,7 +210,53 @@ def main_app():
         soil_area = np.sum(mask == 2)
         total_area = moss_area + soil_area
         percent = moss_area / total_area * 100 if total_area > 0 else 0
+        
+        # Сохранение маски в цветах для обучения
+        from PIL import Image as PILImage
+        from io import BytesIO as _BytesIO
+        color_map = {
+            0: [0, 0, 0],
+            1: [42, 125, 209],
+            2: [170, 240, 209],
+        }
+        mask_rgb = np.zeros((*mask.shape, 3), dtype=np.uint8)
+        for idx, color in color_map.items():
+            mask_rgb[mask == idx] = color
+
+        buf = BytesIO()
+        PILImage.fromarray(mask_rgb).save(buf, format="PNG")
+        st.download_button(
+            label="📥 Скачать маску",
+            data=buf.getvalue(),
+            file_name=f"{name}_mask.png",
+            mime="image/png"
+        )
+
+        if "all_masks_zip" not in st.session_state:
+            st.session_state["all_masks_zip"] = {}
+        st.session_state["all_masks_zip"][name] = mask_rgb
+
         st.markdown(f"**Покрытие мхом:** {percent:.2f}%")
+
+
+    # Кнопка скачивания всех масок
+    import tempfile, zipfile, os
+    if "all_masks_zip" in st.session_state:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "moss_masks.zip")
+            with zipfile.ZipFile(zip_path, "w") as zipf:
+                for name, mask_rgb in st.session_state["all_masks_zip"].items():
+                    out_path = os.path.join(tmpdir, f"{name}_mask.png")
+                    PILImage.fromarray(mask_rgb).save(out_path)
+                    zipf.write(out_path, arcname=os.path.basename(out_path))
+            with open(zip_path, "rb") as f:
+                st.sidebar.download_button(
+                    label="📦 Скачать все маски (ZIP)",
+                    data=f.read(),
+                    file_name="moss_masks.zip",
+                    mime="application/zip"
+                )
+
 
 if __name__ == '__main__':
     main_app()
